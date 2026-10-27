@@ -4,9 +4,11 @@ declare(strict_types=1);
 
 namespace Liberu\BrowserGame\Quests\Support;
 
+use Illuminate\Database\Eloquent\Builder;
 use Illuminate\Support\Facades\DB;
 use Illuminate\Support\Str;
 use Illuminate\Validation\ValidationException;
+use Liberu\BrowserGame\Quests\Events\QuestCompleted;
 use Liberu\BrowserGame\Quests\Events\QuestProgressed;
 use Liberu\BrowserGame\Quests\Models\Quest;
 use Liberu\BrowserGame\Quests\Models\QuestProgress;
@@ -18,17 +20,168 @@ final class QuestsManager
         if (trim($name) === '' || trim($slug) === '' || $objectives === []) {
             throw ValidationException::withMessages(['quest' => 'Name, slug, and objectives are required.']);
         }
+        if (Quest::query()->where('slug', $slug)->exists()) {
+            throw ValidationException::withMessages(['slug' => 'The quest slug is already in use.']);
+        }
 
         return Quest::query()->create(['id' => (string) Str::uuid(), 'name' => $name, 'slug' => $slug, 'objectives' => $objectives, 'rewards' => $rewards, 'repeatable' => $repeatable, 'tenant_id' => $tenantId, 'team_id' => $teamId, 'status' => 'active']);
     }
 
-    public function progress(Quest $quest, string $actorId, array $progress, string $status = 'in_progress'): QuestProgress
+    /** @param array<string, mixed> $context */
+    public function accept(Quest $quest, string $actorId, array $context = [], ?string $idempotencyKey = null): QuestProgress
     {
-        if (trim($actorId) === '' || ! in_array($status, ['in_progress', 'completed', 'abandoned'], true)) {
-            throw ValidationException::withMessages(['progress' => 'Valid actor and status are required.']);
-        } $result = DB::transaction(fn (): QuestProgress => QuestProgress::query()->updateOrCreate(['quest_id' => $quest->getKey(), 'actor_id' => $actorId], ['id' => (string) Str::uuid(), 'progress' => $progress, 'status' => $status]));
-        QuestProgressed::dispatch((string) $quest->getKey(), $actorId, $status);
+        $quest = $quest->fresh() ?? $quest;
+        $this->assertActor($actorId);
+        if ($quest->status !== 'active') {
+            throw ValidationException::withMessages(['quest' => 'The quest is not available.']);
+        }
+        $completed = $this->completedQuestKeys($quest, $actorId);
+        $existingProgress = $this->progressQuery($quest, $actorId)->first();
+        foreach ((array) ($quest->prerequisites ?? []) as $prerequisite) {
+            if (! in_array((string) (is_array($prerequisite) ? ($prerequisite['quest'] ?? '') : $prerequisite), $completed, true) && ! ($quest->repeatable && (int) ($existingProgress?->completion_count ?? 0) > 0)) {
+                throw ValidationException::withMessages(['prerequisites' => 'The quest prerequisites are not complete.']);
+            }
+        }
+
+        return DB::transaction(function () use ($quest, $actorId, $idempotencyKey): QuestProgress {
+            $progress = $this->progressQuery($quest, $actorId)->lockForUpdate()->first();
+            if ($progress !== null && $idempotencyKey !== null && $progress->last_operation_key === $idempotencyKey) {
+                return $progress;
+            }
+            if ($progress !== null && $progress->status === 'in_progress') {
+                return $progress;
+            }
+            $progress ??= new QuestProgress(['id' => (string) Str::uuid(), 'quest_id' => $quest->getKey(), 'actor_id' => $actorId, 'tenant_id' => $quest->tenant_id, 'team_id' => $quest->team_id]);
+            $progress->fill(['status' => 'in_progress', 'progress' => (array) ($progress->progress ?? []), 'accepted_at' => now(), 'completed_at' => null, 'reward_claimed_at' => null, 'last_operation_key' => $idempotencyKey]);
+            $progress->save();
+
+            return $progress->fresh();
+        });
+    }
+
+    public function progress(Quest $quest, string $actorId, array $progress, string $status = 'in_progress', ?string $idempotencyKey = null): QuestProgress
+    {
+        $this->assertActor($actorId);
+        if (! in_array($status, ['in_progress', 'completed'], true)) {
+            throw ValidationException::withMessages(['progress' => 'Progress updates may only be active or completed.']);
+        }
+        $current = $this->progressQuery($quest, $actorId)->first();
+        if ($current === null || $current->status !== 'in_progress') {
+            $current = $this->accept($quest, $actorId);
+        }
+        $merged = array_replace((array) $current->progress, $progress);
+        $result = DB::transaction(function () use ($quest, $actorId, $merged, $idempotencyKey): QuestProgress {
+            $record = $this->progressQuery($quest, $actorId)->lockForUpdate()->firstOrFail();
+            if ($idempotencyKey !== null && $record->last_operation_key === $idempotencyKey) {
+                return $record;
+            }
+            $record->fill(['progress' => $merged, 'last_operation_key' => $idempotencyKey]);
+            $record->save();
+
+            return $record->fresh();
+        });
+        if ($status === 'completed') {
+            return $this->complete($quest, $actorId, $idempotencyKey, $result->progress);
+        }
+        QuestProgressed::dispatch((string) $quest->getKey(), $actorId, 'in_progress');
 
         return $result;
+    }
+
+    public function complete(Quest $quest, string $actorId, ?string $idempotencyKey = null, ?array $progress = null): QuestProgress
+    {
+        $this->assertActor($actorId);
+        $rewards = [];
+        $completionCount = 0;
+        $result = DB::transaction(function () use ($quest, $actorId, $idempotencyKey, $progress, &$rewards, &$completionCount): QuestProgress {
+            $record = $this->progressQuery($quest, $actorId)->lockForUpdate()->firstOrFail();
+            if ($idempotencyKey !== null && $record->status === 'completed' && $record->last_operation_key === $idempotencyKey) {
+                return $record;
+            }
+            if ($record->status === 'completed' && ! $quest->repeatable) {
+                return $record;
+            }
+            if ($progress !== null) {
+                $record->progress = $progress;
+            }
+            if (! $this->objectivesComplete($quest, (array) $record->progress)) {
+                throw ValidationException::withMessages(['progress' => 'All quest objectives must be complete.']);
+            }
+            $record->fill(['status' => 'completed', 'completed_at' => now(), 'reward_claimed_at' => now(), 'completion_count' => (int) $record->completion_count + 1, 'last_operation_key' => $idempotencyKey]);
+            $record->save();
+            $rewards = (array) $quest->rewards;
+            $completionCount = (int) $record->completion_count;
+
+            return $record->fresh();
+        });
+        QuestProgressed::dispatch((string) $quest->getKey(), $actorId, 'completed');
+        if ($rewards !== []) {
+            QuestCompleted::dispatch((string) $quest->getKey(), $actorId, $rewards, $completionCount);
+        }
+
+        return $result;
+    }
+
+    public function abandon(Quest $quest, string $actorId): QuestProgress
+    {
+        $this->assertActor($actorId);
+        $result = $this->progressQuery($quest, $actorId)->firstOrFail();
+        if ($result->status !== 'in_progress') {
+            throw ValidationException::withMessages(['quest' => 'Only active quests can be abandoned.']);
+        }
+        $result->update(['status' => 'abandoned']);
+        QuestProgressed::dispatch((string) $quest->getKey(), $actorId, 'abandoned');
+
+        return $result->refresh();
+    }
+
+    private function objectivesComplete(Quest $quest, array $progress): bool
+    {
+        foreach ((array) $quest->objectives as $key => $objective) {
+            $objectiveKey = is_array($objective) ? (string) ($objective['key'] ?? $key) : (string) $key;
+            $required = is_array($objective) ? (int) ($objective['quantity'] ?? $objective['required'] ?? 1) : (int) $objective;
+            $actualValue = $progress[$objectiveKey] ?? 0;
+            $actual = is_array($actualValue) ? (int) ($actualValue['quantity'] ?? 0) : (int) $actualValue;
+            if ($actual < $required) {
+                return false;
+            }
+        }
+
+        return true;
+    }
+
+    /** @return list<string> */
+    private function completedQuestKeys(Quest $quest, string $actorId): array
+    {
+        $completedIds = QuestProgress::query()
+            ->where('actor_id', $actorId)
+            ->where('tenant_id', $quest->tenant_id)
+            ->where('team_id', $quest->team_id)
+            ->where('status', 'completed')
+            ->select('quest_id');
+
+        $completed = Quest::query()
+            ->whereIn('id', $completedIds)
+            ->where(fn ($query) => $query->whereNull('tenant_id')->orWhere('tenant_id', $quest->tenant_id))
+            ->where(fn ($query) => $query->whereNull('team_id')->orWhere('team_id', $quest->team_id))
+            ->get(['id', 'slug']);
+
+        return $completed->flatMap(fn (Quest $completedQuest): array => [(string) $completedQuest->getKey(), (string) $completedQuest->slug])->values()->all();
+    }
+
+    private function progressQuery(Quest $quest, string $actorId): Builder
+    {
+        return QuestProgress::query()
+            ->where('quest_id', $quest->getKey())
+            ->where('actor_id', $actorId)
+            ->where('tenant_id', $quest->tenant_id)
+            ->where('team_id', $quest->team_id);
+    }
+
+    private function assertActor(string $actorId): void
+    {
+        if (trim($actorId) === '') {
+            throw ValidationException::withMessages(['actor_id' => 'An actor is required.']);
+        }
     }
 }
